@@ -4,13 +4,15 @@ import time
 import unicodedata
 from datetime import datetime, date
 from zoneinfo import ZoneInfo
-from typing import Dict, List, Optional, Tuple
+from typing import Dict, List, Optional, Tuple, Set
 
 import pandas as pd
 import streamlit as st
 import gspread
 from google.oauth2.service_account import Credentials
 from gspread.exceptions import APIError
+
+APP_VERSION = "2026-03-10-v4"
 
 TZ = ZoneInfo("America/Sao_Paulo")
 
@@ -203,24 +205,49 @@ def normalize_weekday_name(value: str) -> str:
         "segunda": "Segunda",
         "segunda feira": "Segunda",
         "seg": "Segunda",
+
         "terca": "Terca",
         "terca feira": "Terca",
         "ter": "Terca",
+
         "quarta": "Quarta",
         "quarta feira": "Quarta",
         "qua": "Quarta",
+
         "quinta": "Quinta",
         "quinta feira": "Quinta",
         "qui": "Quinta",
+
         "sexta": "Sexta",
         "sexta feira": "Sexta",
         "sex": "Sexta",
+
         "sabado": "Sabado",
         "sab": "Sabado",
+
         "domingo": "Domingo",
         "dom": "Domingo",
     }
     return mapping.get(s, "")
+
+
+def parse_weekday_tokens(value: str) -> Set[str]:
+    s = str(value or "").strip()
+    if not s:
+        return set()
+
+    s_norm = strip_accents(s).lower().strip()
+
+    if s_norm in ["todos", "todo_dia", "todos_os_dias", "diario", "diaria", "diariamente"]:
+        return {"TODOS"}
+
+    parts = re.split(r"[;,/|]+", s)
+    out = set()
+    for p in parts:
+        w = normalize_weekday_name(p)
+        if w:
+            out.add(w)
+    return out
 
 
 def pick_col(df: pd.DataFrame, candidates: List[str]) -> Optional[str]:
@@ -279,7 +306,6 @@ def _clean_hhmm(x: str) -> str:
 def map_itens(df: pd.DataFrame) -> pd.DataFrame:
     df = df.copy()
     ren = {}
-
     raw_cols = list(df.columns)
 
     c_area = pick_col(df, ["area_id", "area", "id_area"])
@@ -287,7 +313,7 @@ def map_itens(df: pd.DataFrame) -> pd.DataFrame:
     c_item = pick_col(df, ["item_id", "id_item", "id", "codigo"])
     c_text = pick_col(df, ["texto", "item", "descricao", "descrição", "atividade", "tarefa", "nome"])
     c_dead = pick_col(df, ["deadline_hhmm", "deadline", "horario", "hora", "prazo", "horario_hhmm"])
-    c_dia = pick_col(df, ["dia_semana", "dias_semana", "dia_da_semana", "dias_da_semana", "dia", "weekday"])
+    c_dia = pick_col(df, ["dia_semana", "dias_semana", "dia_da_semana", "dias_da_semana", "weekday", "weekdays"])
 
     if c_area and c_area != "area_id":
         ren[c_area] = "area_id"
@@ -324,7 +350,7 @@ def map_itens(df: pd.DataFrame) -> pd.DataFrame:
         else:
             df["dia_semana"] = ""
 
-    df["dia_semana"] = df["dia_semana"].astype(str).apply(normalize_weekday_name)
+    df["dia_semana"] = df["dia_semana"].astype(str).str.strip()
 
     if "ativo" in df.columns:
         df = df[df["ativo"].apply(as_bool) | (df["ativo"].astype(str).str.strip() == "")]
@@ -335,7 +361,8 @@ def map_itens(df: pd.DataFrame) -> pd.DataFrame:
     else:
         df = df.sort_values(["area_id", "turno", "item_id"])
 
-    return df.reset_index(drop=True)
+    df = df.reset_index(drop=True)
+    return df
 
 
 def map_users(df: pd.DataFrame) -> pd.DataFrame:
@@ -366,13 +393,26 @@ def filter_items_by_weekday(df: pd.DataFrame, weekday_name: str) -> pd.DataFrame
     if "dia_semana" not in df.columns:
         return df.copy()
 
+    def _keep(cell_value: str) -> bool:
+        tokens = parse_weekday_tokens(cell_value)
+        if not tokens:
+            return True
+        if "TODOS" in tokens:
+            return True
+        return weekday_name in tokens
+
     df2 = df.copy()
-    df2["dia_semana"] = df2["dia_semana"].fillna("").astype(str).apply(normalize_weekday_name)
-    return df2[(df2["dia_semana"] == "") | (df2["dia_semana"] == weekday_name)].copy()
+    df2 = df2[df2["dia_semana"].apply(_keep)].copy()
+
+    dedup_cols = [c for c in ["area_id", "turno", "item_id", "texto", "dia_semana"] if c in df2.columns]
+    if dedup_cols:
+        df2 = df2.drop_duplicates(subset=dedup_cols, keep="first").reset_index(drop=True)
+
+    return df2
 
 
 @st.cache_data(ttl=300)
-def load_config_tables(cache_buster: int) -> Dict[str, pd.DataFrame]:
+def load_config_tables(cache_buster: int, version_token: str) -> Dict[str, pd.DataFrame]:
     require_ids()
     ws_areas = pick_tab(CONFIG_SHEET_ID, WS_AREAS_CANDIDATES)
     ws_itens = pick_tab(CONFIG_SHEET_ID, WS_ITENS_CANDIDATES)
@@ -387,7 +427,7 @@ def load_config_tables(cache_buster: int) -> Dict[str, pd.DataFrame]:
 
 
 @st.cache_data(ttl=300)
-def load_users_table(cache_buster: int) -> pd.DataFrame:
+def load_users_table(cache_buster: int, version_token: str) -> pd.DataFrame:
     require_ids()
     ws_users = pick_tab(RULES_SHEET_ID, WS_USERS_CANDIDATES)
     users_raw = to_df(read_all_values(RULES_SHEET_ID, ws_users))
@@ -395,7 +435,7 @@ def load_users_table(cache_buster: int) -> pd.DataFrame:
 
 
 @st.cache_data(ttl=30)
-def load_events_last(cache_buster: int, last_rows: int = 2000) -> pd.DataFrame:
+def load_events_last(cache_buster: int, version_token: str, last_rows: int = 2000) -> pd.DataFrame:
     require_ids()
     ws = get_or_create_tab(LOGS_SHEET_ID, EVENTS_TAB, rows=20000, cols=30)
     write_header_if_empty(ws, EVENTS_HEADER)
@@ -541,6 +581,7 @@ def authenticate(users_df: pd.DataFrame) -> Optional[Dict[str, str]]:
 
     st.title("Login")
     st.caption("Acesso protegido por usuario e senha.")
+    st.caption(f"Versao do app: {APP_VERSION}")
 
     u = st.text_input("Usuario", key="u")
     p = st.text_input("Senha", type="password", key="p")
@@ -565,8 +606,31 @@ def authenticate(users_df: pd.DataFrame) -> Optional[Dict[str, str]]:
     return None
 
 
+def render_debug_panel(cfg: Dict[str, pd.DataFrame], filtered_items: pd.DataFrame, weekday_name: str, day_iso: str):
+    itens = cfg["itens"]
+
+    with st.expander("Diagnostico de leitura", expanded=False):
+        st.write("Versao:", APP_VERSION)
+        st.write("Data considerada:", day_iso)
+        st.write("Dia considerado:", weekday_name)
+        st.write("Colunas ITENS:", list(itens.columns))
+        st.write("Total de itens lidos:", len(itens))
+        st.write("Total de itens filtrados para o dia:", len(filtered_items))
+
+        if "dia_semana" in itens.columns:
+            amostra = itens["dia_semana"].astype(str).head(20).tolist()
+            st.write("Amostra da coluna dia_semana:", amostra)
+            contagem = itens["dia_semana"].astype(str).value_counts(dropna=False).head(20)
+            st.dataframe(contagem.rename_axis("dia_semana").reset_index(name="qtde"), use_container_width=True)
+
+        cols_show = [c for c in ["area_id", "turno", "item_id", "texto", "dia_semana"] if c in filtered_items.columns]
+        if cols_show:
+            st.dataframe(filtered_items[cols_show].head(100), use_container_width=True)
+
+
 def page_dashboard(cfg: Dict[str, pd.DataFrame], events_df: pd.DataFrame):
     st.subheader("Dashboard operacional")
+    st.caption(f"Versao do app: {APP_VERSION}")
 
     areas = cfg["areas"]
     itens = cfg["itens"]
@@ -593,20 +657,34 @@ def page_dashboard(cfg: Dict[str, pd.DataFrame], events_df: pd.DataFrame):
     itens_dia = filter_items_by_weekday(itens, day_weekday)
     mp = latest_status_map_for_day(events_df, day_iso)
 
-    st.info(f"Resumo considerando: {day_weekday} | {day_iso}")
+    st.success(f"Resumo considerando o dia: {day_weekday} | {day_iso}")
+    st.caption(f"Itens carregados: {len(itens)} | Itens filtrados para o dia: {len(itens_dia)}")
 
-    turnos = sorted(itens_dia["turno"].dropna().astype(str).str.strip().unique().tolist())
+    render_debug_panel(cfg, itens_dia, day_weekday, day_iso)
+
+    turnos = sorted(
+        itens_dia["turno"].dropna().astype(str).str.strip().unique().tolist()
+    )
 
     for _, a in areas.iterrows():
         area_id = str(a["area_id"]).strip()
         area_nome = str(a["area_nome"]).strip()
         st.markdown(f"### {area_nome}")
 
-        cols = st.columns(2 if len(turnos) >= 2 else 1)
-        for i, turno in enumerate(turnos):
-            df_items = itens_dia[(itens_dia["area_id"] == area_id) & (itens_dia["turno"] == turno)].copy()
-            total = len(df_items)
+        df_area = itens_dia[itens_dia["area_id"] == area_id].copy()
+        if df_area.empty:
+            st.caption(f"Sem itens para {area_nome} em {day_weekday}.")
+            continue
 
+        cols = st.columns(2 if len(turnos) >= 2 else 1)
+        card_index = 0
+
+        for turno in turnos:
+            df_items = df_area[df_area["turno"] == turno].copy()
+            if df_items.empty:
+                continue
+
+            total = len(df_items)
             ok = 0
             nok = 0
             atraso = 0
@@ -617,6 +695,7 @@ def page_dashboard(cfg: Dict[str, pd.DataFrame], events_df: pd.DataFrame):
                 raw_status = mp.get(key, "PENDENTE")
                 deadline = str(it["deadline_hhmm"]).strip() if "deadline_hhmm" in df_items.columns else ""
                 eff = compute_item_effective_status_for_day(day_iso, raw_status, deadline)
+
                 if eff == "OK":
                     ok += 1
                 elif eff == "NAO_OK":
@@ -634,7 +713,7 @@ def page_dashboard(cfg: Dict[str, pd.DataFrame], events_df: pd.DataFrame):
             elif ok > 0 and ok < total:
                 bg = "#8b6b12"
 
-            with cols[i % len(cols)]:
+            with cols[card_index % len(cols)]:
                 st.markdown(
                     f"""
                     <div style="border-radius:16px;padding:14px;margin:8px 0;background:{bg};color:white;">
@@ -647,10 +726,12 @@ def page_dashboard(cfg: Dict[str, pd.DataFrame], events_df: pd.DataFrame):
                     """,
                     unsafe_allow_html=True,
                 )
+            card_index += 1
 
 
 def page_checklist(cfg: Dict[str, pd.DataFrame], events_df: pd.DataFrame, user: Dict[str, str]):
     st.subheader("Checklist")
+    st.caption(f"Versao do app: {APP_VERSION}")
 
     areas = cfg["areas"]
     itens = cfg["itens"]
@@ -659,16 +740,21 @@ def page_checklist(cfg: Dict[str, pd.DataFrame], events_df: pd.DataFrame, user: 
     today_iso = today_date.isoformat()
     today_weekday = weekday_pt(today_date)
 
-    itens = filter_items_by_weekday(itens, today_weekday)
+    itens_dia = filter_items_by_weekday(itens, today_weekday)
     mp = latest_status_map_for_day(events_df, today_iso)
 
-    st.info(f"Checklist do dia: {today_weekday} | {today_iso}")
+    st.success(f"Checklist considerando o dia: {today_weekday} | {today_iso}")
+    st.caption(f"Itens carregados: {len(itens)} | Itens filtrados para o dia: {len(itens_dia)}")
+
+    render_debug_panel(cfg, itens_dia, today_weekday, today_iso)
 
     areas_labels = [f"{r['area_nome']} ({r['area_id']})" for _, r in areas.iterrows()]
     area_sel = st.selectbox("Area", areas_labels, index=0)
     area_id = area_sel.split("(")[-1].replace(")", "").strip()
 
-    turnos = sorted(itens[itens["area_id"] == area_id]["turno"].dropna().astype(str).str.strip().unique().tolist())
+    turnos = sorted(
+        itens_dia[itens_dia["area_id"] == area_id]["turno"].dropna().astype(str).str.strip().unique().tolist()
+    )
     if not turnos:
         st.warning(f"Sem turnos para esta area em {today_weekday}.")
         return
@@ -679,7 +765,7 @@ def page_checklist(cfg: Dict[str, pd.DataFrame], events_df: pd.DataFrame, user: 
         st.session_state["cache_buster"] += 1
         st.rerun()
 
-    df_items = itens[(itens["area_id"] == area_id) & (itens["turno"] == turno_sel)].copy()
+    df_items = itens_dia[(itens_dia["area_id"] == area_id) & (itens_dia["turno"] == turno_sel)].copy()
     if df_items.empty:
         st.warning(f"Sem itens para esta combinacao em {today_weekday}.")
         return
@@ -782,6 +868,7 @@ def page_checklist(cfg: Dict[str, pd.DataFrame], events_df: pd.DataFrame, user: 
 
 def page_events(events_df: pd.DataFrame):
     st.subheader("EVENTS")
+    st.caption(f"Versao do app: {APP_VERSION}")
     if st.button("Atualizar EVENTS"):
         st.session_state["cache_buster"] += 1
         st.rerun()
@@ -796,6 +883,7 @@ def main():
 
     with st.sidebar:
         st.markdown("## Checklist Operacional")
+        st.caption(f"Versao: {APP_VERSION}")
 
         if st.button("Logout"):
             for k in list(st.session_state.keys()):
@@ -815,9 +903,9 @@ def main():
         st.session_state.setdefault("nav", "Dashboard")
         st.radio("Ir para", ["Dashboard", "Checklist", "EVENTS"], key="nav", label_visibility="collapsed")
 
-    cfg = load_config_tables(st.session_state["cache_buster"])
-    users_df = load_users_table(st.session_state["cache_buster"])
-    events_df = load_events_last(st.session_state["cache_buster"], last_rows=2000)
+    cfg = load_config_tables(st.session_state["cache_buster"], APP_VERSION)
+    users_df = load_users_table(st.session_state["cache_buster"], APP_VERSION)
+    events_df = load_events_last(st.session_state["cache_buster"], APP_VERSION, last_rows=2000)
 
     user = authenticate(users_df)
     if not user:
